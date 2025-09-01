@@ -1,18 +1,12 @@
 // sw.js - Self-contained HTTPS Proxy Service Worker
 
-// Map<port, ConnectionObject>
-// ConnectionObject: {socket, conn_id, pending, resolvers}
 const connections = new Map();
 const fetchResolvers = new Map();
 
 function getConnection(port) {
     if (connections.has(port)) {
         const conn = connections.get(port);
-        // Check if the socket is in a connecting, open, or closing state
-        if (conn.socket.readyState < 2) {
-            return conn;
-        }
-        // If it's closed, remove it and we'll create a new one
+        if (conn.socket.readyState < 2) return conn;
         connections.delete(port);
     }
 
@@ -23,23 +17,21 @@ function getConnection(port) {
         socket: socket,
         conn_id: null,
         pending: new Promise((resolve, reject) => {
-            socket.addEventListener('open', () => {
-                console.log(`SW: WebSocket opened for port ${port}`);
-            });
+            socket.addEventListener('open', () => console.log(`SW: WebSocket opened for port ${port}`));
             socket.addEventListener('error', (err) => {
                 console.error(`SW: WebSocket error for port ${port}.`, err);
-                connections.delete(port); // Clean up on error
+                connections.delete(port);
                 reject(new Error("WebSocket connection failed."));
             });
             socket.addEventListener('close', () => {
                 console.log(`SW: WebSocket closed for port ${port}.`);
-                connections.delete(port); // Clean up on close
+                connections.delete(port);
             });
             socket.addEventListener('message', (event) => {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'connection_ready') {
                     connection.conn_id = msg.conn_id;
-                    console.log(`SW: Connection ready for port ${port}, conn_id: ${connection.conn_id.substring(0, 8)}`);
+                    console.log(`SW: Connection ready for port ${port}`);
                     resolve(connection);
                 } else if (msg.type === 'http_response') {
                     const resolver = fetchResolvers.get(msg.fetchId);
@@ -47,8 +39,6 @@ function getConnection(port) {
                         resolver(msg);
                         fetchResolvers.delete(msg.fetchId);
                     }
-                } else {
-                    console.log("SW: Received unknown message type", msg.type);
                 }
             });
         }),
@@ -60,9 +50,14 @@ function getConnection(port) {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     const port = url.searchParams.get('port');
+    const b64path = url.searchParams.get('path');
 
-    if (!port) return;
-    if (url.pathname.endsWith('/index.html') || url.pathname === '/') return;
+    if (!port || !b64path) return;
+
+    // The path from the browser is Base64 encoded, so we must decode it.
+    const decodedPath = atob(b64path);
+
+    console.log(`SW: Intercepting fetch for decoded path: ${decodedPath}`);
 
     event.respondWith(
         (async () => {
@@ -87,10 +82,10 @@ self.addEventListener('fetch', (event) => {
                 const requestData = {
                     type: 'http_request',
                     conn_id: connection.conn_id,
-                    fetchId: fetchId, // The agent must echo this back
+                    fetchId: fetchId,
                     method: event.request.method,
                     headers: Object.fromEntries(event.request.headers.entries()),
-                    path: url.pathname + url.search,
+                    path: decodedPath, // Send the DECODED path to the agent
                     body: bodyB64,
                 };
 
