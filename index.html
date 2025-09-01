@@ -2,108 +2,43 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>WebSocket Tunnel Controller</title>
+    <title>Proxy Tunnel Initializer</title>
     <style>
-        body { font-family: sans-serif; color: #333; background-color: #f4f4f4; }
-        #container { max-width: 600px; margin: 50px auto; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        #status { font-weight: bold; padding: 10px; border-radius: 4px; }
-        .connected { color: #2a7e2a; background-color: #e9f9e9; }
-        .disconnected { color: #a72d2d; background-color: #f9e9e9; }
-        .info { color: #31708f; background-color: #d9edf7; }
-        p { line-height: 1.6; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f8f9fa; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        #container { max-width: 500px; text-align: center; padding: 40px; background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1 { color: #007bff; }
+        #status { font-weight: bold; padding: 10px; margin-top: 20px; border-radius: 4px; }
+        .success { color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb; }
+        .error { color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; }
     </style>
 </head>
 <body>
     <div id="container">
-        <h1>Proxy Controller</h1>
-        <div id="status" class="info">Initializing...</div>
-        <p>This page is the controller for the Service Worker proxy. Keep this tab open to maintain the tunnel connection.</p>
-        <p>To use the proxy, navigate to any page on this site with the same <code>?port=...</code> parameter.</p>
+        <h1>Proxy Tunnel</h1>
+        <div id="status">Initializing...</div>
+        <p>This page installs the proxy service worker. Once installed, you can browse to any page on this site, and requests will be tunneled.</p>
     </div>
 
     <script>
         const statusDiv = document.getElementById('status');
-        let conn_id = null;
-        let socket = null;
 
-        async function registerServiceWorker() {
-            if (!('serviceWorker' in navigator)) {
+        window.addEventListener('load', async () => {
+            if ('serviceWorker' in navigator) {
+                try {
+                    const registration = await navigator.serviceWorker.register('./sw.js', { scope: './' });
+                    statusDiv.textContent = 'Proxy service active! You can now navigate to your proxied content.';
+                    statusDiv.className = 'success';
+                    console.log('Service Worker registered successfully:', registration);
+                } catch (error) {
+                    statusDiv.textContent = 'Error: Service Worker registration failed.';
+                    statusDiv.className = 'error';
+                    console.error('Service Worker registration failed:', error);
+                }
+            } else {
                 statusDiv.textContent = 'Error: Service Workers are not supported by this browser.';
-                statusDiv.className = 'disconnected';
-                return;
-            }
-            try {
-                const registration = await navigator.serviceWorker.register('./sw.js', { scope: './' });
-                console.log('Service Worker registered with scope:', registration.scope);
-            } catch (error) {
-                statusDiv.textContent = 'Error: Service Worker registration failed.';
-                statusDiv.className = 'disconnected';
-                console.error('SW registration failed:', error);
-            }
-        }
-
-        function connectWebSocket(port) {
-            const ws_uri = `wss://${window.location.hostname || 'localhost'}:8765/?port=${port}`;
-            statusDiv.textContent = 'Connecting to relay server...';
-            statusDiv.className = 'info';
-
-            socket = new WebSocket(ws_uri);
-
-            socket.onopen = () => console.log('WebSocket connection opened, waiting for session...');
-            socket.onerror = (err) => {
-                statusDiv.textContent = 'Error: Could not connect to relay server. Make sure the server is running and you have accepted its self-signed certificate.';
-                statusDiv.className = 'disconnected';
-            };
-            socket.onclose = () => {
-                statusDiv.textContent = 'Disconnected from relay server.';
-                statusDiv.className = 'disconnected';
-                conn_id = null;
-            };
-
-            socket.onmessage = (event) => {
-                const message = JSON.parse(event.data);
-                switch (message.type) {
-                    case 'connection_ready':
-                        conn_id = message.conn_id;
-                        statusDiv.textContent = `Connected! Proxy is active for port ${port}.`;
-                        statusDiv.className = 'connected';
-                        break;
-                    case 'http_response':
-                        // Forward the response to the service worker
-                        navigator.serviceWorker.controller?.postMessage(message);
-                        break;
-                    case 'terminated':
-                        socket.close();
-                        break;
-                }
-            };
-        }
-
-        // Listen for requests from the service worker
-        navigator.serviceWorker.addEventListener('message', (event) => {
-            const { type, fetchId, request } = event.data;
-
-            if (type === 'http_request') {
-                if (socket && socket.readyState === WebSocket.OPEN && conn_id) {
-                    // Add the connection ID and forward to the websocket
-                    socket.send(JSON.stringify({ ...request, conn_id, fetchId, type: 'http_request' }));
-                } else {
-                    console.error("Cannot proxy request, WebSocket is not connected.");
-                }
+                statusDiv.className = 'error';
             }
         });
-
-        window.onload = function() {
-            registerServiceWorker();
-            const params = new URLSearchParams(window.location.search);
-            const port = parseInt(params.get('port'), 10);
-            if (!port) {
-                statusDiv.textContent = 'Error: No port specified in URL (?port=...).';
-                statusDiv.className = 'disconnected';
-                return;
-            }
-            connectWebSocket(port);
-        };
     </script>
 </body>
 </html>

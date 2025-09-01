@@ -6,10 +6,13 @@ import base64
 import ssl
 import aiohttp
 
-async def handle_http_request(session, conn_id, request_data, websocket, local_host, local_port):
+async def handle_http_request(session, request_data, websocket):
     """
     Takes a JSON representation of an HTTP request, performs it, and sends the response back.
     """
+    conn_id = request_data.get("conn_id")
+    fetch_id = request_data.get("fetchId") # The unique ID for this specific fetch event
+
     try:
         method = request_data.get("method", "GET")
         headers = request_data.get("headers", {})
@@ -17,12 +20,15 @@ async def handle_http_request(session, conn_id, request_data, websocket, local_h
         body_b64 = request_data.get("body")
 
         body_bytes = base64.b64decode(body_b64) if body_b64 else None
+
+        # Construct the URL for the local service
+        local_host = websocket.local_host
+        local_port = websocket.local_port
         url = f"http://{local_host}:{local_port}{path}"
 
-        # Important headers to remove/modify for a proxy
-        headers.pop('host', None) # Let aiohttp set the correct host header
+        headers.pop('host', None)
 
-        print(f"Proxying: {method} {path} for conn_id {conn_id[:8]}")
+        print(f"Proxying: {method} {path} for fetch_id {fetch_id[:8]}")
 
         async with session.request(
             method, url, headers=headers, data=body_bytes, allow_redirects=False
@@ -33,7 +39,7 @@ async def handle_http_request(session, conn_id, request_data, websocket, local_h
 
             response_data = {
                 "type": "http_response",
-                "conn_id": conn_id,
+                "fetchId": fetch_id, # Echo the fetch_id back to the service worker
                 "status": response.status,
                 "status_text": response.reason or "",
                 "headers": response_headers,
@@ -43,10 +49,10 @@ async def handle_http_request(session, conn_id, request_data, websocket, local_h
                 await websocket.send(json.dumps(response_data))
 
     except Exception as e:
-        print(f"Error handling HTTP request for {conn_id[:8]}: {e}")
+        print(f"Error handling HTTP request for fetch_id {fetch_id[:8]}: {e}")
         error_response = {
             "type": "http_response",
-            "conn_id": conn_id,
+            "fetchId": fetch_id,
             "status": 502,
             "status_text": "Bad Gateway",
             "headers": {"Content-Type": "text/plain"},
@@ -55,7 +61,7 @@ async def handle_http_request(session, conn_id, request_data, websocket, local_h
         if websocket.open:
             await websocket.send(json.dumps(error_response))
 
-async def handle_server_messages(websocket, local_host, local_port):
+async def handle_server_messages(websocket):
     """
     Listens for messages from the server and dispatches tasks.
     """
@@ -67,9 +73,7 @@ async def handle_server_messages(websocket, local_host, local_port):
 
                 if msg_type == "http_request":
                     asyncio.create_task(
-                        handle_http_request(
-                            session, message.get("conn_id"), message, websocket, local_host, local_port
-                        )
+                        handle_http_request(session, message, websocket)
                     )
             except Exception as e:
                 print(f"Error processing message from server: {e}")
@@ -84,12 +88,15 @@ async def main(args):
         try:
             print(f"Connecting to secure relay server at {uri}...")
             async with websockets.connect(uri, ssl=ssl_context) as websocket:
+                websocket.local_host = args.local_host
+                websocket.local_port = args.local_port
+
                 print("Connection established. Waiting for registration confirmation...")
                 response = json.loads(await websocket.recv())
 
                 if response.get("type") == "agent_registered":
                     print(f"Agent successfully registered for port {args.local_port}")
-                    await handle_server_messages(websocket, args.local_host, args.local_port)
+                    await handle_server_messages(websocket)
                 else:
                     print(f"Failed to register agent: {response.get('message', 'Unknown error')}")
                     break
