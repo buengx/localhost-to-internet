@@ -106,6 +106,7 @@ function connectAndFetch(port, path) {
     const socket = new WebSocket(ws_uri);
 
     let conn_id = null;
+    const pendingRequests = new Map(); // Track pending HTTP requests
 
     socket.addEventListener('open', () => {
         console.log("WebSocket connection opened. Waiting for connection_ready.");
@@ -123,36 +124,193 @@ function connectAndFetch(port, path) {
             conn_id = message.conn_id;
             console.log(`Connection ready with conn_id: ${conn_id}. Fetching path: ${path}`);
 
+            // Setup request interception after connection is ready
+            setupRequestInterception(socket, conn_id, port, pendingRequests);
+
             const requestData = {
                 type: 'http_request',
                 conn_id: conn_id,
-                fetchId: crypto.randomUUID(), // Still useful for debugging on the agent
+                fetchId: crypto.randomUUID(),
                 method: 'GET',
-                headers: { 'Accept': 'text/html' }, // Simple headers for a simple GET
+                headers: { 'Accept': 'text/html' },
                 path: path,
-                body: '', // No body for GET
+                body: '',
             };
             socket.send(JSON.stringify(requestData));
 
         } else if (message.type === 'http_response') {
-            console.log("Received http_response from proxy.");
+            const fetchId = message.fetchId;
+            console.log(`Received http_response for fetchId: ${fetchId.substring(0, 8)}`);
 
+            // Check if this is a pending intercepted request
+            if (pendingRequests.has(fetchId)) {
+                const { resolve } = pendingRequests.get(fetchId);
+                pendingRequests.delete(fetchId);
+                
+                // Create a Response object for intercepted requests
+                const responseInit = {
+                    status: message.status,
+                    statusText: message.status_text,
+                    headers: new Headers(message.headers)
+                };
+                
+                const responseBody = atob(message.body);
+                const response = new Response(responseBody, responseInit);
+                resolve(response);
+                return;
+            }
+
+            // This is the initial page load
             const response_body = atob(message.body);
-
-            // This is the key part: we replace the document's content.
-            // We use DOMParser to avoid issues with scripts in the head.
             const parser = new DOMParser();
             const newDoc = parser.parseFromString(response_body, 'text/html');
-
-            // Replace the entire document element with the new one.
-            // This is more robust than innerHTML as it handles <head> and <body> correctly.
             document.documentElement.replaceWith(newDoc.documentElement);
-
-            // The socket will close after this, as the page is effectively reloaded.
         }
     });
 
     socket.addEventListener('close', () => {
         console.log("WebSocket connection closed.");
+    });
+}
+
+function setupRequestInterception(socket, conn_id, port, pendingRequests) {
+    // Store original functions
+    const originalFetch = window.fetch;
+    const originalXMLHttpRequest = window.XMLHttpRequest;
+
+    // Intercept fetch requests
+    window.fetch = async function(url, options = {}) {
+        const fullUrl = new URL(url, window.location.href);
+        
+        // Only intercept requests to localhost or the current hostname
+        if (shouldIntercept(fullUrl, port)) {
+            console.log(`Intercepting fetch request to: ${fullUrl.pathname}`);
+            return await proxyRequest(socket, conn_id, fullUrl, options, pendingRequests);
+        }
+        
+        // Let other requests go through normally
+        return originalFetch.call(this, url, options);
+    };
+
+    // Intercept XMLHttpRequest
+    const OriginalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = function() {
+        const xhr = new OriginalXHR();
+        const originalOpen = xhr.open;
+        const originalSend = xhr.send;
+        
+        let intercepted = false;
+        let requestUrl;
+        let requestOptions = {};
+
+        xhr.open = function(method, url, async = true, user, password) {
+            requestUrl = new URL(url, window.location.href);
+            requestOptions.method = method;
+            
+            if (shouldIntercept(requestUrl, port)) {
+                intercepted = true;
+                console.log(`Intercepting XHR request to: ${requestUrl.pathname}`);
+                return; // Don't call original open for intercepted requests
+            }
+            
+            return originalOpen.call(this, method, url, async, user, password);
+        };
+
+        xhr.send = function(body) {
+            if (intercepted) {
+                // Handle intercepted request
+                requestOptions.body = body;
+                
+                // Copy headers from XHR to options
+                requestOptions.headers = {};
+                
+                proxyRequest(socket, conn_id, requestUrl, requestOptions, pendingRequests)
+                    .then(response => {
+                        // Simulate XHR response
+                        Object.defineProperty(xhr, 'status', { value: response.status, writable: false });
+                        Object.defineProperty(xhr, 'statusText', { value: response.statusText, writable: false });
+                        Object.defineProperty(xhr, 'readyState', { value: 4, writable: false });
+                        
+                        response.text().then(text => {
+                            Object.defineProperty(xhr, 'responseText', { value: text, writable: false });
+                            Object.defineProperty(xhr, 'response', { value: text, writable: false });
+                            
+                            if (xhr.onreadystatechange) xhr.onreadystatechange();
+                            if (xhr.onload) xhr.onload();
+                        });
+                    })
+                    .catch(error => {
+                        console.error('XHR proxy error:', error);
+                        if (xhr.onerror) xhr.onerror();
+                    });
+                
+                return;
+            }
+            
+            return originalSend.call(this, body);
+        };
+
+        return xhr;
+    };
+}
+
+function shouldIntercept(url, port) {
+    // Intercept requests to localhost on the specified port, or relative URLs
+    const hostname = url.hostname;
+    const urlPort = url.port;
+    
+    return (hostname === 'localhost' || hostname === '127.0.0.1') && 
+           (urlPort === port.toString() || urlPort === '');
+}
+
+async function proxyRequest(socket, conn_id, url, options, pendingRequests) {
+    const fetchId = crypto.randomUUID();
+    
+    // Prepare headers
+    const headers = { ...options.headers };
+    if (options.method === 'POST' && options.body && !headers['Content-Type']) {
+        headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+
+    // Prepare body
+    let bodyB64 = '';
+    if (options.body) {
+        if (typeof options.body === 'string') {
+            bodyB64 = btoa(options.body);
+        } else if (options.body instanceof FormData) {
+            // Convert FormData to URLSearchParams for simplicity
+            const params = new URLSearchParams();
+            for (const [key, value] of options.body) {
+                params.append(key, value);
+            }
+            bodyB64 = btoa(params.toString());
+        } else {
+            bodyB64 = btoa(options.body.toString());
+        }
+    }
+
+    const requestData = {
+        type: 'http_request',
+        conn_id: conn_id,
+        fetchId: fetchId,
+        method: options.method || 'GET',
+        headers: headers,
+        path: url.pathname + url.search,
+        body: bodyB64,
+    };
+
+    // Create a promise to resolve when response comes back
+    return new Promise((resolve, reject) => {
+        pendingRequests.set(fetchId, { resolve, reject });
+        
+        // Set a timeout to avoid hanging forever
+        setTimeout(() => {
+            if (pendingRequests.has(fetchId)) {
+                pendingRequests.delete(fetchId);
+                reject(new Error('Request timeout'));
+            }
+        }, 30000);
+        
+        socket.send(JSON.stringify(requestData));
     });
 }

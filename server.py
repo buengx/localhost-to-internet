@@ -24,7 +24,9 @@ async def cleanup_session(conn_id, reason=""):
         if agent_ws and agent_ws.open:
              await agent_ws.send(json.dumps({"type": "close_connection", "conn_id": conn_id}))
 
-async def handler(websocket, path):
+async def handler(websocket):
+    # In websockets 15.x, we need to get the path from the handshake request
+    path = websocket.request.path if hasattr(websocket, 'request') else '/'
     is_agent = False
     registered_port = None
 
