@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket Tunnel</title>
+    <style>
+        body { font-family: sans-serif; }
+        #status { font-weight: bold; }
+        #output {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            border: 1px solid #ccc;
+            padding: 10px;
+            min-height: 100px;
+            background-color: #f9f9f9;
+        }
+        textarea { width: 100%; box-sizing: border-box; }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Tunnel Client</h1>
+    <div id="status">Initializing...</div>
+    <hr>
+    <div>
+        <label for="message">Message to send:</label><br>
+        <textarea id="message" rows="4"></textarea><br>
+        <button id="send" disabled>Send</button>
+    </div>
+    <h2>Received Data:</h2>
+    <pre id="output"></pre>
+
+    <script>
+        const output = document.getElementById('output');
+        const messageInput = document.getElementById('message');
+        const sendButton = document.getElementById('send');
+        const statusDiv = document.getElementById('status');
+
+        let conn_id = null;
+        let socket = null;
+
+        function decodePayload(payload) {
+            try {
+                const binaryString = atob(payload);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            } catch (e) {
+                console.error("Failed to decode payload as UTF-8 text:", e);
+                return `[Received ${payload.length} bytes of binary data]\n`;
+            }
+        }
+
+        function encodePayload(str) {
+            try {
+                const utf8Bytes = new TextEncoder().encode(str);
+                const binaryString = String.fromCharCode(...utf8Bytes);
+                return btoa(binaryString);
+            } catch (e) {
+                console.error("Failed to encode string:", e);
+                return "";
+            }
+        }
+
+        window.onload = function() {
+            const params = new URLSearchParams(window.location.search);
+            const port = parseInt(params.get('port'), 10);
+
+            if (!port) {
+                statusDiv.textContent = 'Error: No port specified. Please add "?port=<number>" to the URL.';
+                return;
+            }
+
+            statusDiv.textContent = `Connecting to relay for port ${port}...`;
+            socket = new WebSocket(`ws://${window.location.hostname || 'localhost'}:8765`);
+
+            socket.onopen = function(event) {
+                socket.send(JSON.stringify({
+                    type: 'request_connection',
+                    port: port
+                }));
+            };
+
+            socket.onmessage = function(event) {
+                const message = JSON.parse(event.data);
+                console.log('Message from server:', message);
+
+                switch (message.type) {
+                    case 'connection_ready':
+                        conn_id = message.conn_id;
+                        statusDiv.textContent = `Connected! Port: ${port}, Session: ${conn_id.substring(0, 8)}...`;
+                        sendButton.disabled = false;
+                        messageInput.focus();
+                        break;
+                    case 'data':
+                        const decoded_data = decodePayload(message.payload);
+                        output.textContent += decoded_data;
+                        break;
+                    case 'terminated':
+                        statusDiv.textContent = `Connection Terminated: ${message.reason}`;
+                        sendButton.disabled = true;
+                        if (socket.readyState === WebSocket.OPEN) socket.close();
+                        break;
+                    case 'error':
+                         statusDiv.textContent = `Error from server: ${message.message}`;
+                         sendButton.disabled = true;
+                         if (socket.readyState === WebSocket.OPEN) socket.close();
+                         break;
+                }
+            };
+
+            socket.onclose = function(event) {
+                console.log('WebSocket connection closed.');
+                if (!statusDiv.textContent.startsWith("Error") && !statusDiv.textContent.startsWith("Connection Terminated")) {
+                    statusDiv.textContent = 'Disconnected.';
+                }
+                sendButton.disabled = true;
+            };
+
+            socket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                statusDiv.textContent = 'Error: Could not connect to the relay server.';
+            };
+
+            sendButton.onclick = function() {
+                const message = messageInput.value;
+                if (message && conn_id) {
+                    const encoded_payload = encodePayload(message);
+                    if(encoded_payload) {
+                        socket.send(JSON.stringify({
+                            type: 'data',
+                            conn_id: conn_id,
+                            payload: encoded_payload
+                        }));
+                    }
+                    messageInput.value = '';
+                }
+            };
+
+            messageInput.addEventListener('keydown', function(event) {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    sendButton.click();
+                }
+            });
+        };
+    </script>
+</body>
+</html>
