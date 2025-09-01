@@ -2,17 +2,15 @@ import asyncio
 import websockets
 import json
 import uuid
+import ssl
+from urllib.parse import urlparse, parse_qs
 
-# {port: agent_websocket}
 AGENTS = {}
-# {conn_id: {'browser': browser_websocket, 'agent': agent_websocket}}
 SESSIONS = {}
-# {websocket: conn_id}
 WEBSOCKET_TO_CONN_ID = {}
 
 async def cleanup_session(conn_id, reason=""):
-    """Gracefully cleans up a session."""
-    print(f"Cleaning up session {conn_id}. Reason: {reason}")
+    print(f"Cleaning up session {conn_id[:8]}. Reason: {reason}")
     session = SESSIONS.pop(conn_id, None)
     if session:
         browser_ws = session.get('browser')
@@ -21,38 +19,29 @@ async def cleanup_session(conn_id, reason=""):
         if browser_ws and browser_ws in WEBSOCKET_TO_CONN_ID:
             del WEBSOCKET_TO_CONN_ID[browser_ws]
             if browser_ws.open:
-                await browser_ws.send(json.dumps({"type": "terminated", "reason": f"Connection closed: {reason}"}))
-                await browser_ws.close()
+                await browser_ws.close(1000, f"Connection closed: {reason}")
 
-        # We don't remove the agent from WEBSOCKET_TO_CONN_ID because one agent can have multiple sessions
-        # But we do notify the agent to close the specific TCP connection.
         if agent_ws and agent_ws.open:
              await agent_ws.send(json.dumps({"type": "close_connection", "conn_id": conn_id}))
 
 async def handler(websocket, path):
-    """
-    Manages connections from agents and browsers.
-    """
-    # This handler can now manage multiple types of clients on the same endpoint
-    # It will determine the type based on the initial message received.
-    # We will also track which websocket is an agent for cleanup purposes.
     is_agent = False
     registered_port = None
 
     try:
-        # The first message determines the client type and intent
-        message_str = await websocket.recv()
-        message = json.loads(message_str)
-        msg_type = message.get("type")
+        query_params = parse_qs(urlparse(path).query)
+        client_type = query_params.get('type', [None])[0]
+        port_str = query_params.get('port', [None])[0]
 
-        if msg_type == "register": # Agent registers itself
-            port = message.get("port")
-            if not isinstance(port, int):
-                await websocket.close(1003, "Port must be an integer.")
-                return
+        if not port_str:
+            await websocket.close(1003, "Port must be specified.")
+            return
 
+        port = int(port_str)
+
+        if client_type == 'agent':
             if port in AGENTS:
-                await websocket.send(json.dumps({"type": "error", "message": f"Port {port} is already being served."}))
+                await websocket.send(json.dumps({"type": "error", "message": f"Port {port} already served."}))
                 await websocket.close()
                 return
 
@@ -60,16 +49,12 @@ async def handler(websocket, path):
             is_agent = True
             registered_port = port
             print(f"Agent registered for port {port}")
-            await websocket.send(json.dumps({"type": "registered", "port": port}))
+            await websocket.send(json.dumps({"type": "agent_registered", "port": port}))
 
-        elif msg_type == "request_connection": # Browser requests a connection
-            port = message.get("port")
-            if not isinstance(port, int):
-                await websocket.close(1003, "Port must be an integer.")
-                return
-
+        else:
+            path_param = query_params.get('path', ['/'])[0]
             if port not in AGENTS:
-                await websocket.send(json.dumps({"type": "error", "message": f"No agent is serving port {port}."}))
+                await websocket.send(json.dumps({"type": "error", "message": f"No agent for port {port}."}))
                 await websocket.close()
                 return
 
@@ -79,65 +64,69 @@ async def handler(websocket, path):
             SESSIONS[conn_id] = {"browser": websocket, "agent": agent_ws}
             WEBSOCKET_TO_CONN_ID[websocket] = conn_id
 
-            await agent_ws.send(json.dumps({"type": "new_connection", "conn_id": conn_id}))
+            # The new HTTP proxy model doesn't strictly need new_connection,
+            # but it's useful for the agent to know a browser has connected.
+            # We'll leave it for potential future use or debugging.
+            await agent_ws.send(json.dumps({
+                "type": "new_connection", "conn_id": conn_id, "path": path_param
+            }))
             await websocket.send(json.dumps({"type": "connection_ready", "conn_id": conn_id}))
-            print(f"Session {conn_id} created for port {port}")
+            print(f"Session {conn_id[:8]} created for port {port} with path {path_param}")
 
-        else:
-            await websocket.close(1003, "Unsupported message type")
-            return
-
-        # Main message loop for data relaying
+        # Generic message relay loop
         async for message_str in websocket:
-            message = json.loads(message_str)
-            msg_type = message.get("type")
+            try:
+                message = json.loads(message_str)
+                conn_id = message.get("conn_id")
 
-            if msg_type != "data":
-                continue
+                if not conn_id or conn_id not in SESSIONS:
+                    continue
 
-            current_conn_id = message.get("conn_id")
-            if not current_conn_id or current_conn_id not in SESSIONS:
-                continue
+                session = SESSIONS[conn_id]
 
-            session = SESSIONS[current_conn_id]
-            payload = message.get("payload")
+                if websocket == session.get("browser"):
+                    recipient_ws = session.get("agent")
+                else: # It's from the agent
+                    recipient_ws = session.get("browser")
 
-            if websocket == session["browser"]:
-                recipient_ws = session["agent"]
-                # Agent needs to know which connection the data belongs to
-                await recipient_ws.send(json.dumps({"type": "data", "conn_id": current_conn_id, "payload": payload}))
-            elif websocket == session["agent"]:
-                recipient_ws = session["browser"]
-                # Browser doesn't need the conn_id in the payload, it just receives the data
-                await recipient_ws.send(json.dumps({"type": "data", "payload": payload}))
+                if recipient_ws and recipient_ws.open:
+                    await recipient_ws.send(message_str)
+            except json.JSONDecodeError:
+                print(f"Received non-JSON message, ignoring: {message_str[:100]}")
 
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"Connection closed: {websocket.remote_address} ({e})")
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
     except Exception as e:
         print(f"An error occurred in handler: {e}")
     finally:
         if is_agent:
-            if registered_port and registered_port in AGENTS:
+            if registered_port is not None and AGENTS.get(registered_port) == websocket:
                 del AGENTS[registered_port]
                 print(f"Agent for port {registered_port} deregistered.")
-                # Clean up all sessions associated with this disconnected agent
-                sessions_to_clean = [sid for sid, s in SESSIONS.items() if s['agent'] == websocket]
+                sessions_to_clean = [sid for sid, s in SESSIONS.items() if s.get('agent') == websocket]
                 for sid in sessions_to_clean:
                     await cleanup_session(sid, "Agent disconnected")
         else:
-            # This was a browser client
             conn_id = WEBSOCKET_TO_CONN_ID.get(websocket)
             if conn_id:
                 await cleanup_session(conn_id, "Browser disconnected")
 
-
 async def main():
-    print("Starting smart relay server on ws://localhost:8765")
-    async with websockets.serve(handler, "localhost", 8765):
-        await asyncio.Future()  # Run forever
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ssl_context.load_cert_chain("cert.pem", keyfile="key.pem")
+    except FileNotFoundError:
+        print("Error: cert.pem or key.pem not found.")
+        print("Please generate them by running: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'")
+        return
+
+    print("Starting secure relay server on wss://localhost:8765")
+    async with websockets.serve(handler, "localhost", 8765, ssl=ssl_context):
+        await asyncio.Future()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Server shutting down.")
+        print("\nServer shutting down.")
