@@ -4,7 +4,7 @@ window.addEventListener('load', () => {
     const b64path = params.get('path');
 
     if (!port || !b64path) {
-        document.body.innerHTML = '<h1>Error</h1><p>Missing "port" or "path" in URL.</p>';
+        showHomepage();
         return;
     }
 
@@ -16,6 +16,90 @@ window.addEventListener('load', () => {
         console.error("Base64 Decode Error:", e);
     }
 });
+
+function showHomepage() {
+    document.title = 'Localhost to Internet Proxy';
+    document.body.innerHTML = `
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px; font-family: sans-serif;">
+            <h1>Localhost to Internet Proxy</h1>
+            <p>Enter the localhost address you want to access through the proxy:</p>
+            
+            <form id="proxyForm" style="margin: 20px 0;">
+                <div style="margin-bottom: 15px;">
+                    <label for="localAddress" style="display: block; margin-bottom: 5px; font-weight: bold;">
+                        Localhost Address:
+                    </label>
+                    <input 
+                        type="text" 
+                        id="localAddress" 
+                        placeholder="localhost:3000/api/endpoint" 
+                        style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px;"
+                        required
+                    />
+                    <small style="color: #666; margin-top: 5px; display: block;">
+                        Examples: localhost:3000, localhost:8080/api, 127.0.0.1:5000/dashboard
+                    </small>
+                </div>
+                
+                <button 
+                    type="submit" 
+                    style="background: #007cba; color: white; padding: 12px 24px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer;"
+                >
+                    Connect via Proxy
+                </button>
+            </form>
+            
+            <div style="margin-top: 30px; padding: 15px; background: #f5f5f5; border-radius: 4px;">
+                <h3 style="margin-top: 0;">How it works:</h3>
+                <ol style="margin: 10px 0; padding-left: 20px;">
+                    <li>Enter your localhost address (with port and optional path)</li>
+                    <li>The proxy will connect to your local server through a secure relay</li>
+                    <li>You can share the resulting URL to give others access to your localhost</li>
+                </ol>
+            </div>
+        </div>
+    `;
+    
+    document.getElementById('proxyForm').addEventListener('submit', handleFormSubmit);
+}
+
+function handleFormSubmit(e) {
+    e.preventDefault();
+    
+    const localAddress = document.getElementById('localAddress').value.trim();
+    if (!localAddress) {
+        alert('Please enter a localhost address');
+        return;
+    }
+    
+    // Parse the localhost address
+    const match = localAddress.match(/^(?:https?:\/\/)?([^\/]+)(.*)$/);
+    if (!match) {
+        alert('Invalid address format. Please use format like: localhost:3000/path');
+        return;
+    }
+    
+    const hostPort = match[1];
+    const path = match[2] || '/';
+    
+    // Extract port from host:port
+    const portMatch = hostPort.match(/:(\d+)$/);
+    if (!portMatch) {
+        alert('Please specify a port number (e.g., localhost:3000)');
+        return;
+    }
+    
+    const port = portMatch[1];
+    
+    // Base64 encode the path (standard base64 for atob compatibility)
+    const b64path = btoa(path);
+    
+    // Construct the new URL
+    const newUrl = `${window.location.origin}${window.location.pathname}?port=${port}&path=${b64path}`;
+    
+    // Navigate to the proxy URL
+    window.location.href = newUrl;
+}
 
 function connectAndFetch(port, path) {
     const ws_uri = `wss://${window.location.hostname || 'localhost'}:8765/?port=${port}`;
