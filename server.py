@@ -1,10 +1,12 @@
 import asyncio
 import websockets
+from websockets import Response
 import json
 import uuid
 import ssl
 import aiohttp
 import base64
+import os
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 
@@ -229,6 +231,62 @@ async def handler(websocket):
                 await session_data["session"].close()
             await cleanup_session(conn_id, "Browser disconnected")
 
+async def serve_static_file(path, start_response):
+    """Serve static files (index.html, script.js) for HTTP requests"""
+    # Remove leading slash and handle empty path
+    if path == "/" or path == "":
+        path = "index.html"
+    elif path.startswith("/"):
+        path = path[1:]
+    
+    # Security check - only allow specific files
+    allowed_files = ["index.html", "script.js"]
+    if path not in allowed_files:
+        return ("404 Not Found", "text/plain", "File not found")
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        if path.endswith(".html"):
+            content_type = "text/html"
+        elif path.endswith(".js"):
+            content_type = "application/javascript"
+        else:
+            content_type = "text/plain"
+            
+        return ("200 OK", content_type, content)
+    except FileNotFoundError:
+        return ("404 Not Found", "text/plain", "File not found")
+
+async def process_request(connection, request):
+    """Process incoming requests - serve static files for HTTP, delegate WebSocket to handler"""
+    # Check if this is a WebSocket upgrade request by looking at headers
+    connection_header = request.headers.get("connection", "").lower()
+    upgrade_header = request.headers.get("upgrade", "").lower()
+    
+    if "upgrade" in connection_header and upgrade_header == "websocket":
+        # This is a WebSocket request, let the WebSocket server handle it
+        return None
+    
+    # This is an HTTP request, serve static files
+    status, content_type, content = await serve_static_file(request.path, None)
+    
+    # Return a proper Response object
+    if status == "200 OK":
+        status_code = 200
+        reason_phrase = "OK"
+    else:
+        status_code = 404
+        reason_phrase = "Not Found"
+        
+    from websockets.datastructures import Headers
+    headers = Headers()
+    headers["Content-Type"] = content_type
+    headers["Content-Length"] = str(len(content.encode("utf-8")))
+    
+    return Response(status_code, reason_phrase, headers, content.encode("utf-8"))
+
 async def main():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
@@ -239,7 +297,16 @@ async def main():
         return
 
     print("Starting secure relay server on wss://localhost:8765")
-    async with websockets.serve(handler, "localhost", 8765, ssl=ssl_context):
+    print("Web interface available at https://localhost:8765/")
+    
+    # Use process_request to handle both HTTP and WebSocket requests
+    async with websockets.serve(
+        handler, 
+        "localhost", 
+        8765, 
+        ssl=ssl_context,
+        process_request=process_request
+    ):
         await asyncio.Future()
 
 if __name__ == "__main__":
