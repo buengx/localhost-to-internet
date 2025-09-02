@@ -58,9 +58,69 @@ Generate self-signed certificates for the relay server:
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
 ```
 
+## Firebase State Management for Static Sites
+
+The proxy now includes Firebase Realtime Database integration to provide persistent state storage for static sites. This is particularly useful when proxying static websites that need to store user data, preferences, or application state.
+
+### Firebase Configuration
+
+1. **Environment Variables** (recommended):
+```bash
+export FIREBASE_DATABASE_URL=https://your-project-id-default-rtdb.firebaseio.com
+export FIREBASE_AUTH_TOKEN=your-auth-token  # Optional for public databases
+```
+
+2. **Configuration File**:
+Copy `firebase_config.json.example` to `firebase_config.json` and update with your Firebase details:
+```json
+{
+  "firebase_url": "https://your-project-id-default-rtdb.firebaseio.com",
+  "auth_token": "your-auth-token",
+  "enable_for_static": true,
+  "auto_detect_static": true
+}
+```
+
+### Using Firebase State in Static Sites
+
+When the proxy detects static content and Firebase is configured, it automatically injects a `FirebaseState` JavaScript object:
+
+```javascript
+// Get state data
+const userData = await FirebaseState.get('user_preferences');
+
+// Set state data
+await FirebaseState.set('user_preferences', { theme: 'dark', language: 'en' });
+
+// Update multiple values
+await FirebaseState.update({
+  last_visit: new Date().toISOString(),
+  page_views: userData.page_views + 1
+});
+
+// Delete state data
+await FirebaseState.delete('temporary_data');
+```
+
+### Static Site Detection
+
+The proxy automatically detects static content based on:
+- File extensions (.html, .css, .js, .png, etc.)
+- Content-Type headers
+- Absence of dynamic server indicators (cookies, framework headers)
+
+### Benefits
+
+- **Persistent Storage**: Data survives browser restarts and proxy restarts
+- **Cross-Device Sync**: Share state across different devices/browsers
+- **No Backend Required**: Static sites gain database functionality without modification
+- **Automatic Integration**: No manual setup required in static site code
+
 ## Architecture
 
 - **WebSocket Relay**: Secure communication between browsers and agents
 - **HTTP Proxy**: Agents handle HTTP requests to localhost and return responses
 - **Link Rewriting**: Automatic rewriting of HTML links to work through the proxy
 - **Base64 Encoding**: Paths are base64-encoded in URLs for safe transport
+- **Firebase Integration**: Automatic state management for static sites using Firebase Realtime Database
+- **Static Content Detection**: Intelligent detection of static vs dynamic content for appropriate Firebase integration

@@ -39,3 +39,6 @@ Thumbs.db
 /tmp/
 *.tmp
 *.log
+
+# Firebase configuration (exclude actual config, keep example)
+firebase_config.json

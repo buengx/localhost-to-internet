@@ -1,0 +1,6 @@
+{
+  "firebase_url": "https://your-project-id-default-rtdb.firebaseio.com",
+  "auth_token": null,
+  "enable_for_static": true,
+  "auto_detect_static": true
+}

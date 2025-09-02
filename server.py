@@ -9,9 +9,14 @@ import base64
 import os
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
+from firebase_config import (
+    FirebaseStateManager, load_firebase_config, 
+    is_static_content, generate_site_id
+)
 
 SESSIONS = {}
 WEBSOCKET_TO_CONN_ID = {}
+FIREBASE_MANAGER = None
 
 def rewrite_url(url_str, port):
     """
@@ -73,10 +78,23 @@ async def handle_http_request(session, request_data, websocket, localhost_port):
             response_headers = {key: value for key, value in response.headers.items()}
             content_type = response_headers.get('content-type', '').lower()
 
+            # Check if this is static content and Firebase is available
+            is_static = is_static_content(content_type, response_headers, path)
+            if is_static and FIREBASE_MANAGER:
+                site_id = generate_site_id(localhost_port)
+                print(f"Detected static content for site {site_id}, Firebase state management available")
+                # Add Firebase state management metadata to response headers
+                response_headers['X-Static-Site-ID'] = site_id
+                response_headers['X-Firebase-State-Available'] = 'true'
+
             # Rewrite HTML links to go through the proxy
             if 'text/html' in content_type:
                 print(f"Rewriting HTML links for fetch_id {fetch_id[:8]}")
                 soup = BeautifulSoup(response_body, "lxml")
+
+                # If this is a static site with Firebase, inject state management script
+                if is_static and FIREBASE_MANAGER:
+                    inject_firebase_state_script(soup, generate_site_id(localhost_port))
 
                 tags_to_rewrite = {'a': 'href', 'link': 'href', 'img': 'src', 'script': 'src', 'iframe': 'src'}
                 for tag_name, attr_name in tags_to_rewrite.items():
@@ -115,6 +133,169 @@ async def handle_http_request(session, request_data, websocket, localhost_port):
             await websocket.send(json.dumps(error_response))
         except Exception as e:
             print(f"Failed to send error response: {e}")
+
+def inject_firebase_state_script(soup, site_id):
+    """
+    Inject Firebase state management script into HTML content for static sites.
+    
+    Args:
+        soup: BeautifulSoup object of the HTML content
+        site_id: Unique identifier for the static site
+    """
+    # Create Firebase state management script
+    firebase_script = soup.new_tag('script')
+    firebase_script.string = f"""
+// Firebase State Management for Static Sites
+window.FirebaseState = {{
+    siteId: '{site_id}',
+    
+    async get(key) {{
+        try {{
+            const response = await fetch(`/_firebase_state/${{this.siteId}}/${{key || ''}}`, {{
+                method: 'GET',
+                headers: {{ 'X-Firebase-Request': 'true' }}
+            }});
+            if (response.ok) {{
+                return await response.json();
+            }}
+            return null;
+        }} catch (e) {{
+            console.error('Firebase State GET error:', e);
+            return null;
+        }}
+    }},
+    
+    async set(key, value) {{
+        try {{
+            const response = await fetch(`/_firebase_state/${{this.siteId}}/${{key}}`, {{
+                method: 'PUT',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'X-Firebase-Request': 'true'
+                }},
+                body: JSON.stringify(value)
+            }});
+            return response.ok;
+        }} catch (e) {{
+            console.error('Firebase State SET error:', e);
+            return false;
+        }}
+    }},
+    
+    async update(updates) {{
+        try {{
+            const response = await fetch(`/_firebase_state/${{this.siteId}}`, {{
+                method: 'PATCH',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'X-Firebase-Request': 'true'
+                }},
+                body: JSON.stringify(updates)
+            }});
+            return response.ok;
+        }} catch (e) {{
+            console.error('Firebase State UPDATE error:', e);
+            return false;
+        }}
+    }},
+    
+    async delete(key) {{
+        try {{
+            const response = await fetch(`/_firebase_state/${{this.siteId}}/${{key || ''}}`, {{
+                method: 'DELETE',
+                headers: {{ 'X-Firebase-Request': 'true' }}
+            }});
+            return response.ok;
+        }} catch (e) {{
+            console.error('Firebase State DELETE error:', e);
+            return false;
+        }}
+    }}
+}};
+
+console.log('Firebase State Management loaded for site:', '{site_id}');
+"""
+    
+    # Insert script before closing head tag, or create head if it doesn't exist
+    head = soup.find('head')
+    if not head:
+        head = soup.new_tag('head')
+        if soup.html:
+            soup.html.insert(0, head)
+        else:
+            soup.insert(0, head)
+    
+    head.append(firebase_script)
+
+async def handle_firebase_state_request(path, method, headers, body):
+    """
+    Handle Firebase state management API requests.
+    
+    Args:
+        path: Request path (expected format: /_firebase_state/site_id/key)
+        method: HTTP method
+        headers: Request headers
+        body: Request body
+        
+    Returns:
+        Tuple of (status_code, response_headers, response_body)
+    """
+    if not FIREBASE_MANAGER:
+        return (503, {"Content-Type": "text/plain"}, "Firebase not configured")
+    
+    # Parse path: /_firebase_state/site_id/key
+    path_parts = path.strip('/').split('/')
+    if len(path_parts) < 2 or path_parts[0] != '_firebase_state':
+        return (400, {"Content-Type": "text/plain"}, "Invalid Firebase state path")
+    
+    site_id = path_parts[1]
+    key = path_parts[2] if len(path_parts) > 2 else None
+    
+    try:
+        if method == 'GET':
+            data = await FIREBASE_MANAGER.get_state(site_id, key)
+            return (200, {"Content-Type": "application/json"}, json.dumps(data))
+        
+        elif method == 'PUT':
+            if not key:
+                return (400, {"Content-Type": "text/plain"}, "Key required for PUT")
+            
+            try:
+                value = json.loads(body) if body else None
+            except json.JSONDecodeError:
+                return (400, {"Content-Type": "text/plain"}, "Invalid JSON body")
+            
+            success = await FIREBASE_MANAGER.set_state(site_id, key, value)
+            if success:
+                return (200, {"Content-Type": "text/plain"}, "OK")
+            else:
+                return (500, {"Content-Type": "text/plain"}, "Firebase error")
+        
+        elif method == 'PATCH':
+            try:
+                updates = json.loads(body) if body else {{}}
+            except json.JSONDecodeError:
+                return (400, {"Content-Type": "text/plain"}, "Invalid JSON body")
+            
+            success = await FIREBASE_MANAGER.update_state(site_id, updates)
+            if success:
+                return (200, {"Content-Type": "text/plain"}, "OK")
+            else:
+                return (500, {"Content-Type": "text/plain"}, "Firebase error")
+        
+        elif method == 'DELETE':
+            success = await FIREBASE_MANAGER.delete_state(site_id, key)
+            if success:
+                return (200, {"Content-Type": "text/plain"}, "OK")
+            else:
+                return (500, {"Content-Type": "text/plain"}, "Firebase error")
+        
+        else:
+            return (405, {"Content-Type": "text/plain"}, "Method not allowed")
+    
+    except Exception as e:
+        print(f"Firebase state request error: {e}")
+        return (500, {"Content-Type": "text/plain"}, f"Internal error: {e}")
 
 async def check_localhost_availability(port, path="/"):
     """
@@ -203,15 +384,39 @@ async def handler(websocket):
                 message = json.loads(message_str)
                 
                 if message.get("type") == "http_request":
-                    # Handle HTTP request directly
-                    session_data = SESSIONS.get(conn_id)
-                    if session_data:
-                        asyncio.create_task(handle_http_request(
-                            session_data["session"], 
-                            message, 
-                            websocket, 
-                            port
-                        ))
+                    # Check if this is a Firebase state management request
+                    request_path = message.get("path", "/")
+                    if request_path.startswith("/_firebase_state/"):
+                        method = message.get("method", "GET")
+                        headers = message.get("headers", {})
+                        body_b64 = message.get("body")
+                        body = base64.b64decode(body_b64).decode('utf-8') if body_b64 else None
+                        
+                        # Handle Firebase state request
+                        status_code, response_headers, response_body = await handle_firebase_state_request(
+                            request_path, method, headers, body
+                        )
+                        
+                        # Send response back through WebSocket
+                        response_data = {
+                            "type": "http_response",
+                            "fetchId": message.get("fetchId"),
+                            "status": status_code,
+                            "status_text": "OK" if status_code < 400 else "Error",
+                            "headers": response_headers,
+                            "body": base64.b64encode(response_body.encode()).decode('utf-8')
+                        }
+                        await websocket.send(json.dumps(response_data))
+                    else:
+                        # Handle normal HTTP request
+                        session_data = SESSIONS.get(conn_id)
+                        if session_data:
+                            asyncio.create_task(handle_http_request(
+                                session_data["session"], 
+                                message, 
+                                websocket, 
+                                port
+                            ))
                         
             except json.JSONDecodeError:
                 print(f"Received non-JSON message, ignoring: {message_str[:100]}")
@@ -288,6 +493,24 @@ async def process_request(connection, request):
     return Response(status_code, reason_phrase, headers, content.encode("utf-8"))
 
 async def main():
+    global FIREBASE_MANAGER
+    
+    # Initialize Firebase if configured
+    firebase_config = load_firebase_config()
+    if firebase_config:
+        try:
+            FIREBASE_MANAGER = FirebaseStateManager(
+                firebase_config['firebase_url'],
+                firebase_config.get('auth_token')
+            )
+            print(f"Firebase state management initialized: {firebase_config['firebase_url']}")
+        except Exception as e:
+            print(f"Warning: Firebase initialization failed: {e}")
+            print("Continuing without Firebase state management...")
+    else:
+        print("Firebase not configured. Static sites will not have state persistence.")
+        print("To enable Firebase, set FIREBASE_DATABASE_URL environment variable or create firebase_config.json")
+    
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         ssl_context.load_cert_chain("cert.pem", keyfile="key.pem")
