@@ -102,14 +102,14 @@ function handleFormSubmit(e) {
 }
 
 function connectAndFetch(port, path) {
-    const ws_uri = `wss://${window.location.hostname || 'localhost'}:8765/?port=${port}`;
+    const ws_uri = `wss://${window.location.hostname || 'localhost'}:8765/?port=${port}&path=${encodeURIComponent(btoa(path))}`;
     const socket = new WebSocket(ws_uri);
 
     let conn_id = null;
     const pendingRequests = new Map(); // Track pending HTTP requests
 
     socket.addEventListener('open', () => {
-        console.log("WebSocket connection opened. Waiting for connection_ready.");
+        console.log("WebSocket connection opened. Waiting for connection response.");
     });
 
     socket.addEventListener('error', (err) => {
@@ -127,6 +127,7 @@ function connectAndFetch(port, path) {
             // Setup request interception after connection is ready
             setupRequestInterception(socket, conn_id, port, pendingRequests);
 
+            // Make the initial request
             const requestData = {
                 type: 'http_request',
                 conn_id: conn_id,
@@ -138,6 +139,25 @@ function connectAndFetch(port, path) {
             };
             socket.send(JSON.stringify(requestData));
 
+        } else if (message.type === 'error') {
+            // Handle server errors (e.g., service not available)
+            if (message.status === 404) {
+                document.body.innerHTML = `
+                    <div style="max-width: 600px; margin: 0 auto; padding: 20px; font-family: sans-serif;">
+                        <h1>Service Not Available</h1>
+                        <p>No service is running on <strong>localhost:${port}</strong>.</p>
+                        <p>Please ensure your local server is running and try again.</p>
+                        <button onclick="window.location.href='${window.location.origin}${window.location.pathname}'" 
+                                style="background: #007cba; color: white; padding: 12px 24px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer;">
+                            Back to Homepage
+                        </button>
+                    </div>
+                `;
+            } else {
+                document.body.innerHTML = `<h1>Error</h1><p>${message.message}</p>`;
+            }
+            console.error("Server Error:", message);
+            
         } else if (message.type === 'http_response') {
             const fetchId = message.fetchId;
             console.log(`Received http_response for fetchId: ${fetchId.substring(0, 8)}`);
