@@ -132,8 +132,11 @@ async def cleanup_session(conn_id, reason=""):
         
         if browser_ws and browser_ws in WEBSOCKET_TO_CONN_ID:
             del WEBSOCKET_TO_CONN_ID[browser_ws]
-            if browser_ws.open:
-                await browser_ws.close(1000, f"Connection closed: {reason}")
+            if not browser_ws.closed:
+                try:
+                    await browser_ws.close(1000, f"Connection closed: {reason}")
+                except Exception as e:
+                    print(f"Error closing WebSocket: {e}")
 
 async def handler(websocket):
     # Get the path from the WebSocket request
@@ -142,7 +145,7 @@ async def handler(websocket):
     try:
         query_params = parse_qs(urlparse(path).query)
         port_str = query_params.get('port', [None])[0]
-        path_param = query_params.get('path', ['/'])[0]
+        path_param_b64 = query_params.get('path', ['L2'])[0]  # 'L2' is base64 for '/'
 
         if not port_str:
             await websocket.close(1003, "Port must be specified.")
@@ -150,8 +153,15 @@ async def handler(websocket):
 
         port = int(port_str)
 
+        # Decode the base64 path
+        try:
+            path_param = base64.urlsafe_b64decode(path_param_b64).decode('utf-8')
+        except Exception as e:
+            print(f"Failed to decode path parameter '{path_param_b64}': {e}")
+            path_param = '/'
+
         # Check if the localhost service is available
-        print(f"Checking availability of localhost:{port}")
+        print(f"Checking availability of localhost:{port}{path_param}")
         if not await check_localhost_availability(port, path_param):
             await websocket.send(json.dumps({
                 "type": "error", 
