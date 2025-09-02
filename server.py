@@ -94,8 +94,10 @@ async def handle_http_request(session, request_data, websocket, localhost_port):
                 "body": response_body_b64
             }
             
-            if websocket.open:
+            try:
                 await websocket.send(json.dumps(response_data))
+            except Exception as e:
+                print(f"Failed to send response: {e}")
 
     except Exception as e:
         print(f"Error handling HTTP request for fetch_id {fetch_id[:8]}: {e}")
@@ -107,8 +109,10 @@ async def handle_http_request(session, request_data, websocket, localhost_port):
             "headers": {"Content-Type": "text/plain"}, 
             "body": base64.b64encode(f"Proxy error: {e}".encode()).decode()
         }
-        if websocket.open:
+        try:
             await websocket.send(json.dumps(error_response))
+        except Exception as e:
+            print(f"Failed to send error response: {e}")
 
 async def check_localhost_availability(port, path="/"):
     """
@@ -132,11 +136,10 @@ async def cleanup_session(conn_id, reason=""):
         
         if browser_ws and browser_ws in WEBSOCKET_TO_CONN_ID:
             del WEBSOCKET_TO_CONN_ID[browser_ws]
-            if not browser_ws.closed:
-                try:
-                    await browser_ws.close(1000, f"Connection closed: {reason}")
-                except Exception as e:
-                    print(f"Error closing WebSocket: {e}")
+            try:
+                await browser_ws.close(1000, f"Connection closed: {reason}")
+            except Exception as e:
+                print(f"Error closing WebSocket: {e}")
 
 async def handler(websocket):
     # Get the path from the WebSocket request
