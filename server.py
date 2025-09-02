@@ -3,35 +3,152 @@ import websockets
 import json
 import uuid
 import ssl
+import aiohttp
+import base64
 from urllib.parse import urlparse, parse_qs
+from bs4 import BeautifulSoup
 
-AGENTS = {}
 SESSIONS = {}
 WEBSOCKET_TO_CONN_ID = {}
+
+def rewrite_url(url_str, port):
+    """
+    Rewrites a URL to point back to the proxy, if it's relative or a localhost URL.
+    """
+    if not url_str or url_str.startswith('data:'):
+        return url_str
+
+    parsed = urlparse(url_str)
+
+    # Check if the URL is a candidate for rewriting
+    is_localhost = parsed.netloc and parsed.netloc.startswith('localhost')
+    is_relative = not parsed.netloc and parsed.path
+
+    if is_localhost or is_relative:
+        # Use the path from the original URL
+        original_path = parsed.path
+
+        # Base64 encode the path to be used in the new query string
+        b64_path = base64.urlsafe_b64encode(original_path.encode()).decode()
+
+        # The new URL for the browser to fetch will be relative to the current page,
+        # containing only the proxy query parameters.
+        new_query = f"port={port}&path={b64_path}"
+
+        # Construct a new relative URL from scratch
+        # This will result in something like "?port=8000&path=L2Fib3V0Lmh0bWw="
+        return f"?{new_query}"
+
+    return url_str
+
+async def handle_http_request(session, request_data, websocket, localhost_port):
+    """
+    Takes a JSON representation of an HTTP request, performs it against localhost,
+    and sends the response back through the WebSocket.
+    """
+    conn_id = request_data.get("conn_id")
+    fetch_id = request_data.get("fetchId")
+
+    try:
+        method = request_data.get("method", "GET")
+        headers = request_data.get("headers", {})
+        path = request_data.get("path", "/")
+        body_b64 = request_data.get("body")
+
+        body_bytes = base64.b64decode(body_b64) if body_b64 else None
+
+        url = f"http://localhost:{localhost_port}{path}"
+
+        # Remove host header to avoid conflicts
+        headers.pop('host', None)
+        print(f"Proxying: {method} {path} to localhost:{localhost_port} for fetch_id {fetch_id[:8]}")
+
+        async with session.request(
+            method, url, headers=headers, data=body_bytes, allow_redirects=False
+        ) as response:
+
+            response_body = await response.read()
+            response_headers = {key: value for key, value in response.headers.items()}
+            content_type = response_headers.get('content-type', '').lower()
+
+            # Rewrite HTML links to go through the proxy
+            if 'text/html' in content_type:
+                print(f"Rewriting HTML links for fetch_id {fetch_id[:8]}")
+                soup = BeautifulSoup(response_body, "lxml")
+
+                tags_to_rewrite = {'a': 'href', 'link': 'href', 'img': 'src', 'script': 'src', 'iframe': 'src'}
+                for tag_name, attr_name in tags_to_rewrite.items():
+                    for tag in soup.find_all(tag_name, **{attr_name: True}):
+                        tag[attr_name] = rewrite_url(tag[attr_name], localhost_port)
+
+                response_body = soup.encode()
+
+            response_body_b64 = base64.b64encode(response_body).decode('utf-8')
+
+            response_data = {
+                "type": "http_response", 
+                "fetchId": fetch_id, 
+                "status": response.status,
+                "status_text": response.reason or "", 
+                "headers": response_headers, 
+                "body": response_body_b64
+            }
+            
+            try:
+                await websocket.send(json.dumps(response_data))
+            except Exception as e:
+                print(f"Failed to send response: {e}")
+
+    except Exception as e:
+        print(f"Error handling HTTP request for fetch_id {fetch_id[:8]}: {e}")
+        error_response = {
+            "type": "http_response", 
+            "fetchId": fetch_id, 
+            "status": 502, 
+            "status_text": "Bad Gateway",
+            "headers": {"Content-Type": "text/plain"}, 
+            "body": base64.b64encode(f"Proxy error: {e}".encode()).decode()
+        }
+        try:
+            await websocket.send(json.dumps(error_response))
+        except Exception as e:
+            print(f"Failed to send error response: {e}")
+
+async def check_localhost_availability(port, path="/"):
+    """
+    Check if a localhost service is available on the given port.
+    Returns True if available, False otherwise.
+    """
+    try:
+        url = f"http://localhost:{port}{path}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                return True
+    except Exception as e:
+        print(f"Localhost check failed for port {port}: {e}")
+        return False
 
 async def cleanup_session(conn_id, reason=""):
     print(f"Cleaning up session {conn_id[:8]}. Reason: {reason}")
     session = SESSIONS.pop(conn_id, None)
     if session:
         browser_ws = session.get('browser')
-        agent_ws = session.get('agent')
-
+        
         if browser_ws and browser_ws in WEBSOCKET_TO_CONN_ID:
             del WEBSOCKET_TO_CONN_ID[browser_ws]
-            if browser_ws.open:
+            try:
                 await browser_ws.close(1000, f"Connection closed: {reason}")
+            except Exception as e:
+                print(f"Error closing WebSocket: {e}")
 
-        if agent_ws and agent_ws.open:
-             await agent_ws.send(json.dumps({"type": "close_connection", "conn_id": conn_id}))
-
-async def handler(websocket, path):
-    is_agent = False
-    registered_port = None
-
+async def handler(websocket):
+    # Get the path from the WebSocket request
+    path = websocket.request.path if hasattr(websocket, 'request') else '/'
+    
     try:
         query_params = parse_qs(urlparse(path).query)
-        client_type = query_params.get('type', [None])[0]
         port_str = query_params.get('port', [None])[0]
+        path_param_b64 = query_params.get('path', ['L2'])[0]  # 'L2' is base64 for '/'
 
         if not port_str:
             await websocket.close(1003, "Port must be specified.")
@@ -39,78 +156,78 @@ async def handler(websocket, path):
 
         port = int(port_str)
 
-        if client_type == 'agent':
-            if port in AGENTS:
-                await websocket.send(json.dumps({"type": "error", "message": f"Port {port} already served."}))
-                await websocket.close()
-                return
+        # Decode the base64 path
+        try:
+            path_param = base64.urlsafe_b64decode(path_param_b64).decode('utf-8')
+        except Exception as e:
+            print(f"Failed to decode path parameter '{path_param_b64}': {e}")
+            path_param = '/'
 
-            AGENTS[port] = websocket
-            is_agent = True
-            registered_port = port
-            print(f"Agent registered for port {port}")
-            await websocket.send(json.dumps({"type": "agent_registered", "port": port}))
-
-        else:
-            path_param = query_params.get('path', ['/'])[0]
-            if port not in AGENTS:
-                await websocket.send(json.dumps({"type": "error", "message": f"No agent for port {port}."}))
-                await websocket.close()
-                return
-
-            agent_ws = AGENTS[port]
-            conn_id = str(uuid.uuid4())
-
-            SESSIONS[conn_id] = {"browser": websocket, "agent": agent_ws}
-            WEBSOCKET_TO_CONN_ID[websocket] = conn_id
-
-            # The new HTTP proxy model doesn't strictly need new_connection,
-            # but it's useful for the agent to know a browser has connected.
-            # We'll leave it for potential future use or debugging.
-            await agent_ws.send(json.dumps({
-                "type": "new_connection", "conn_id": conn_id, "path": path_param
+        # Check if the localhost service is available
+        print(f"Checking availability of localhost:{port}{path_param}")
+        if not await check_localhost_availability(port, path_param):
+            await websocket.send(json.dumps({
+                "type": "error", 
+                "message": f"No service available on localhost:{port}. Please ensure your local server is running.",
+                "status": 404
             }))
-            await websocket.send(json.dumps({"type": "connection_ready", "conn_id": conn_id}))
-            print(f"Session {conn_id[:8]} created for port {port} with path {path_param}")
+            await websocket.close(1000, "Service not available")
+            return
 
-        # Generic message relay loop
+        # Create a new session for this browser connection
+        conn_id = str(uuid.uuid4())
+        
+        # Create persistent cookie jar for this session
+        cookie_jar = aiohttp.CookieJar(unsafe=True)
+        session = aiohttp.ClientSession(cookie_jar=cookie_jar)
+        
+        SESSIONS[conn_id] = {
+            "browser": websocket, 
+            "port": port, 
+            "session": session
+        }
+        WEBSOCKET_TO_CONN_ID[websocket] = conn_id
+
+        print(f"Session {conn_id[:8]} created for localhost:{port}")
+        await websocket.send(json.dumps({
+            "type": "connection_ready", 
+            "conn_id": conn_id,
+            "status": 200
+        }))
+
+        # Handle incoming messages from the browser
         async for message_str in websocket:
             try:
                 message = json.loads(message_str)
-                conn_id = message.get("conn_id")
-
-                if not conn_id or conn_id not in SESSIONS:
-                    continue
-
-                session = SESSIONS[conn_id]
-
-                if websocket == session.get("browser"):
-                    recipient_ws = session.get("agent")
-                else: # It's from the agent
-                    recipient_ws = session.get("browser")
-
-                if recipient_ws and recipient_ws.open:
-                    await recipient_ws.send(message_str)
+                
+                if message.get("type") == "http_request":
+                    # Handle HTTP request directly
+                    session_data = SESSIONS.get(conn_id)
+                    if session_data:
+                        asyncio.create_task(handle_http_request(
+                            session_data["session"], 
+                            message, 
+                            websocket, 
+                            port
+                        ))
+                        
             except json.JSONDecodeError:
                 print(f"Received non-JSON message, ignoring: {message_str[:100]}")
-
+            except Exception as e:
+                print(f"Error processing message: {e}")
 
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
         print(f"An error occurred in handler: {e}")
     finally:
-        if is_agent:
-            if registered_port is not None and AGENTS.get(registered_port) == websocket:
-                del AGENTS[registered_port]
-                print(f"Agent for port {registered_port} deregistered.")
-                sessions_to_clean = [sid for sid, s in SESSIONS.items() if s.get('agent') == websocket]
-                for sid in sessions_to_clean:
-                    await cleanup_session(sid, "Agent disconnected")
-        else:
-            conn_id = WEBSOCKET_TO_CONN_ID.get(websocket)
-            if conn_id:
-                await cleanup_session(conn_id, "Browser disconnected")
+        # Clean up the session
+        conn_id = WEBSOCKET_TO_CONN_ID.get(websocket)
+        if conn_id:
+            session_data = SESSIONS.get(conn_id)
+            if session_data and session_data.get("session"):
+                await session_data["session"].close()
+            await cleanup_session(conn_id, "Browser disconnected")
 
 async def main():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

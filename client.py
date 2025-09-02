@@ -100,7 +100,9 @@ async def handle_http_request(session, request_data, websocket):
             await websocket.send(json.dumps(error_response))
 
 async def handle_server_messages(websocket):
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as session:
+    # Use a persistent cookie jar to maintain sessions across requests
+    cookie_jar = aiohttp.CookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async for message_str in websocket:
             try:
                 message = json.loads(message_str)
@@ -136,7 +138,11 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Localhost to Internet HTTP Proxy Agent")
-    # ... (parser arguments remain the same)
+    parser.add_argument("--host", default="localhost", help="Relay server hostname (default: localhost)")
+    parser.add_argument("--port", type=int, default=8765, help="Relay server port (default: 8765)")
+    parser.add_argument("--local-host", default="localhost", help="Local server hostname (default: localhost)")
+    parser.add_argument("--local-port", type=int, required=True, help="Local server port to proxy")
+    parser.add_argument("--certfile", default="cert.pem", help="SSL certificate file (default: cert.pem)")
     args = parser.parse_args()
     try:
         asyncio.run(main(args))
